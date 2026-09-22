@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Travel Catalogue</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <main class="container">
+    <header>
+      <h1>🌍 Travel Catalogue</h1>
+      <p>Discover and manage travel destinations.</p>
+    </header>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+        {% for category, message in messages %}
+          <div class="alert {{ category }}">{{ message }}</div>
+        {% endfor %}
+      {% endif %}
+    {% endwith %}
+
+    <section class="card">
+      <h2>Add a destination</h2>
+      <form method="post" action="{{ url_for('add_destination') }}" class="form-grid">
+        <label>Destination name
+          <input name="name" maxlength="100" required placeholder="e.g. Manali">
+        </label>
+        <label>Country
+          <input name="country" maxlength="100" required placeholder="e.g. India">
+        </label>
+        <label>Category
+          <select name="category" required>
+            <option value="">Select category</option>
+            <option>Mountains</option>
+            <option>Beach</option>
+            <option>Historical</option>
+            <option>Adventure</option>
+            <option>City</option>
+            <option>Nature</option>
+          </select>
+        </label>
+        <label>Estimated budget (INR)
+          <input name="budget" type="number" min="1" step="0.01" required placeholder="15000">
+        </label>
+        <label class="full">Description
+          <textarea name="description" maxlength="500" rows="3" placeholder="Short description"></textarea>
+        </label>
+        <button type="submit">Add destination</button>
+      </form>
+    </section>
+
+    <section class="card">
+      <h2>Filter destinations</h2>
+      <form method="get" action="{{ url_for('index') }}" class="filter-grid">
+        <label>Country
+          <select name="country">
+            <option value="">All countries</option>
+            {% for country in countries %}
+              <option value="{{ country }}" {% if selected_country == country %}selected{% endif %}>{{ country }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>Category
+          <select name="category">
+            <option value="">All categories</option>
+            {% for category in categories %}
+              <option value="{{ category }}" {% if selected_category == category %}selected{% endif %}>{{ category }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>Maximum budget (INR)
+          <input type="number" name="max_budget" min="0" step="0.01" value="{{ selected_budget }}">
+        </label>
+        <button type="submit">Apply filters</button>
+        <a class="reset" href="{{ url_for('index') }}">Reset</a>
+      </form>
+    </section>
+
+    <section>
+      <h2>Destinations ({{ destinations|length }})</h2>
+      <div class="cards">
+        {% for item in destinations %}
+          <article class="destination">
+            <h3>{{ item.name }}</h3>
+            <p><strong>Country:</strong> {{ item.country }}</p>
+            <p><strong>Category:</strong> {{ item.category }}</p>
+            <p><strong>Budget:</strong> ₹{{ "%.2f"|format(item.budget) }}</p>
+            <p>{{ item.description or "No description provided." }}</p>
+          </article>
+        {% else %}
+          <p>No destinations match the selected filters.</p>
+        {% endfor %}
+      </div>
+    </section>
+  </main>
+</body>
+</html>
