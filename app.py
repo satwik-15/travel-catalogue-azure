@@ -1,44 +1,43 @@
 import json
 import logging
 import os
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 from flask import Flask, flash, redirect, render_template, request, url_for
 from azure.storage.blob import BlobServiceClient, ContentSettings
-from azure.core.exceptions import ResourceNotFoundError
+from azure.core import MatchConditions
+from azure.core.exceptions import ResourceNotFoundError, ResourceModifiedError
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "change-this-secret-key")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("travel-catalogue")
 
+# Optional Azure Monitor / Application Insights integration. It activates only
+# when the App Service setting APPLICATIONINSIGHTS_CONNECTION_STRING is set.
+if os.environ.get("APPLICATIONINSIGHTS_CONNECTION_STRING"):
+    try:
+        from azure.monitor.opentelemetry import configure_azure_monitor
+        configure_azure_monitor()
+        logger.info("Azure Monitor OpenTelemetry configured")
+    except Exception:
+        logger.exception("Azure Monitor setup failed; app will continue without telemetry")
+
 LOCAL_DATA = Path("data.json")
 CONTAINER_NAME = os.environ.get("AZURE_STORAGE_CONTAINER", "travel-data")
 BLOB_NAME = os.environ.get("AZURE_STORAGE_BLOB", "destinations.json")
+MAX_WRITE_ATTEMPTS = 5
 
 
 def sample_data():
     return [
-        {
-            "id": "sample-1",
-            "name": "Manali",
-            "country": "India",
-            "category": "Mountains",
-            "budget": 15000,
-            "description": "A Himalayan destination with scenic valleys.",
-            "created_at": "2026-09-01T10:00:00+00:00",
-        },
-        {
-            "id": "sample-2",
-            "name": "Goa",
-            "country": "India",
-            "category": "Beach",
-            "budget": 12000,
-            "description": "A coastal destination known for beaches.",
-            "created_at": "2026-09-01T10:00:00+00:00",
-        },
+        {"id": "sample-1", "name": "Manali", "country": "India", "category": "Mountains", "budget": 15000,
+         "description": "A Himalayan destination with scenic valleys.", "created_at": "2026-09-01T10:00:00+00:00"},
+        {"id": "sample-2", "name": "Goa", "country": "India", "category": "Beach", "budget": 12000,
+         "description": "A coastal destination known for beaches.", "created_at": "2026-09-01T10:00:00+00:00"},
     ]
 
 
@@ -47,14 +46,14 @@ def use_azure_storage():
 
 
 def get_blob_client():
-    service = BlobServiceClient.from_connection_string(
-        os.environ["AZURE_STORAGE_CONNECTION_STRING"]
-    )
+    service = BlobServiceClient.from_connection_string(os.environ["AZURE_STORAGE_CONNECTION_STRING"])
     container = service.get_container_client(CONTAINER_NAME)
     try:
         container.create_container()
-    except Exception:
-        pass
+    except Exception as exc:
+        # A concurrent request may have created it; do not hide unrelated errors.
+        if "ContainerAlreadyExists" not in str(exc) and "The specified container already exists" not in str(exc):
+            logger.debug("Container creation skipped/failed: %s", exc)
     return container.get_blob_client(BLOB_NAME)
 
 
@@ -63,17 +62,27 @@ def load_destinations():
         blob = get_blob_client()
         try:
             payload = blob.download_blob().readall()
-            return json.loads(payload.decode("utf-8"))
+            data = json.loads(payload.decode("utf-8"))
+            if not isinstance(data, list):
+                raise ValueError("Blob data must be a JSON array")
+            return data
         except ResourceNotFoundError:
             data = sample_data()
-            save_destinations(data)
-            return data
+            # Create only if absent; if another request wins the race, read it.
+            try:
+                blob.upload_blob(json.dumps(data, indent=2).encode("utf-8"), overwrite=False,
+                                 content_settings=ContentSettings(content_type="application/json"))
+                return data
+            except Exception:
+                try:
+                    return json.loads(blob.download_blob().readall().decode("utf-8"))
+                except Exception:
+                    raise
 
     if not LOCAL_DATA.exists():
         data = sample_data()
         save_destinations(data)
         return data
-
     return json.loads(LOCAL_DATA.read_text(encoding="utf-8"))
 
 
@@ -81,15 +90,49 @@ def save_destinations(data):
     serialized = json.dumps(data, indent=2).encode("utf-8")
     if use_azure_storage():
         blob = get_blob_client()
-        blob.upload_blob(
-            serialized,
-            overwrite=True,
-            content_settings=ContentSettings(
-                content_type="application/json"
-            ),
-        )
+        blob.upload_blob(serialized, overwrite=True,
+                         content_settings=ContentSettings(content_type="application/json"))
     else:
         LOCAL_DATA.write_bytes(serialized)
+
+
+def append_destination_concurrently(destination):
+    """Append using Blob ETag compare-and-swap to prevent lost updates.
+
+    The data and ETag come from the same download. If another request changes
+    the blob before upload, Azure rejects the write and this function retries
+    from the newest version.
+    """
+    if not use_azure_storage():
+        # Local development fallback; Azure deployment uses the ETag path below.
+        data = load_destinations()
+        data.append(destination)
+        save_destinations(data)
+        return
+
+    blob = get_blob_client()
+    for attempt in range(MAX_WRITE_ATTEMPTS):
+        try:
+            downloader = blob.download_blob()
+            current_etag = downloader.properties.etag
+            data = json.loads(downloader.readall().decode("utf-8"))
+            if not isinstance(data, list):
+                raise ValueError("Blob data must be a JSON array")
+            data.append(destination)
+            payload = json.dumps(data, indent=2).encode("utf-8")
+            blob.upload_blob(
+                payload,
+                overwrite=True,
+                etag=current_etag,
+                match_condition=MatchConditions.IfNotModified,
+                content_settings=ContentSettings(content_type="application/json"),
+            )
+            return
+        except ResourceModifiedError:
+            logger.warning("Concurrent Blob update detected; retry %s/%s", attempt + 1, MAX_WRITE_ATTEMPTS)
+            if attempt + 1 == MAX_WRITE_ATTEMPTS:
+                raise
+            time.sleep(0.05 * (attempt + 1))
 
 
 @app.route("/")
@@ -98,7 +141,6 @@ def index():
     country = request.args.get("country", "").strip().lower()
     category = request.args.get("category", "").strip().lower()
     max_budget_raw = request.args.get("max_budget", "").strip()
-
     max_budget = None
     if max_budget_raw:
         try:
@@ -121,16 +163,9 @@ def index():
 
     countries = sorted({item["country"] for item in destinations})
     categories = sorted({item["category"] for item in destinations})
-
-    return render_template(
-        "index.html",
-        destinations=filtered,
-        countries=countries,
-        categories=categories,
-        selected_country=request.args.get("country", ""),
-        selected_category=request.args.get("category", ""),
-        selected_budget=max_budget_raw,
-    )
+    return render_template("index.html", destinations=filtered, countries=countries, categories=categories,
+                           selected_country=request.args.get("country", ""),
+                           selected_category=request.args.get("category", ""), selected_budget=max_budget_raw)
 
 
 @app.route("/add", methods=["POST"])
@@ -140,7 +175,6 @@ def add_destination():
     category = request.form.get("category", "").strip()
     budget_raw = request.form.get("budget", "").strip()
     description = request.form.get("description", "").strip()
-
     errors = []
     if not name:
         errors.append("Destination name is required.")
@@ -148,7 +182,6 @@ def add_destination():
         errors.append("Country is required.")
     if not category:
         errors.append("Category is required.")
-
     try:
         budget = float(budget_raw)
         if budget <= 0:
@@ -156,39 +189,34 @@ def add_destination():
     except ValueError:
         errors.append("Budget must be a positive number.")
         budget = 0
-
     if len(name) > 100 or len(country) > 100 or len(category) > 50:
         errors.append("Name, country, or category is too long.")
     if len(description) > 500:
         errors.append("Description cannot exceed 500 characters.")
-
     if errors:
         for error in errors:
             flash(error, "error")
         return redirect(url_for("index"))
 
-    destinations = load_destinations()
-    destinations.append(
-        {
-            "id": str(uuid.uuid4()),
-            "name": name,
-            "country": country,
-            "category": category,
-            "budget": budget,
-            "description": description,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
-    )
-    save_destinations(destinations)
-    logger.info("Added destination: %s", name)
+    destination = {"id": str(uuid.uuid4()), "name": name, "country": country, "category": category,
+                   "budget": budget, "description": description,
+                   "created_at": datetime.now(timezone.utc).isoformat()}
+    try:
+        append_destination_concurrently(destination)
+    except ResourceModifiedError:
+        logger.exception("Blob remained busy after concurrent write retries")
+        flash("Another update is in progress. Please submit again.", "error")
+        return redirect(url_for("index")), 409
+    logger.info("Added destination id=%s", destination["id"])
     flash("Destination added successfully.", "success")
     return redirect(url_for("index"))
 
 
 @app.route("/health")
 def health():
-    return {"status": "healthy", "storage": "azure_blob" if use_azure_storage() else "local_file"}
+    return {"status": "healthy", "storage": "azure_blob" if use_azure_storage() else "local_file",
+            "application_insights": bool(os.environ.get("APPLICATIONINSIGHTS_CONNECTION_STRING"))}
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
